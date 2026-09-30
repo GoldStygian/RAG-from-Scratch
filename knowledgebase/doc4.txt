@@ -1,0 +1,6 @@
+Account e assistenza
+
+Puoi contattare l'assistenza clienti all'indirizzo support@example.com o al numero 800-123-456.
+L'assistenza clienti è disponibile dal lunedì al venerdì, dalle 9:00 alle 17:00, ora italiana.
+Per reimpostare la password, richiedi un link via email. Il link scade dopo 15 minuti.
+Puoi effettuare un acquisto come ospite oppure creare un account con il tuo indirizzo email.

@@ -1,4 +1,6 @@
 .venv
 basicChatBot.py
 basicEmbeddings.py
-claude.py
+index_cache
+__pycache__
+to-do.txt

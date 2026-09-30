@@ -15,17 +15,29 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 import numpy as np
 from openai import OpenAI
 import faiss # oppure faiss-gpu se hai una GPU NVIDIA con CUDA
+
 from time import perf_counter
 from pathlib import Path
+import hashlib
+import json
 
-DOCUMENT_PATH = Path(__file__).resolve().parent / "knowledgebase"
+BASE_DIR = Path(__file__).resolve().parent
+DOCUMENT_PATH = BASE_DIR / "knowledgebase"
+CACHE_DIR = BASE_DIR / "index_cache"
+MANIFEST_FILE = CACHE_DIR / "manifest.json"
 
 #EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Modello di embedding locale, non richiede Ollama
 EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"  # Modello multilingue adatto anche all'italiano
 EMBEDDING_DEVICE = "cpu" # oppure cuda per GPU Nvidia
 
 MODEL_NAME = "llama3.2:3b" #"qwen2.5:7b" #qwen3.5
-TEMPERATURE = 1
+TEMPERATURE = 0.3
+
+FIND_REVELANT_KNOWLEDGE = 4
+
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 100
+CHUNK_SEPARATORS = ["\n\n", "\n", ". ", "? ", "! ", " ", ""]
 
 client = OpenAI(
     base_url="http://localhost:11434/v1",
@@ -36,13 +48,16 @@ client = OpenAI(
 ## Fase 1.1: Caricamento dei documenti
 def load_documents():
     if not DOCUMENT_PATH.is_dir():
-        raise FileNotFoundError(f"Directory dei documenti non trovata: {DOCUMENT_PATH}")
+        raise FileNotFoundError(f"[-] Directory dei documenti non trovata: {DOCUMENT_PATH}")
 
-    documents = [
-        file_path.read_text(encoding="utf-8").strip()
-        for file_path in sorted(DOCUMENT_PATH.glob("*.txt"))
-    ]
-    documents = [document for document in documents if document]
+    documents = []
+    for file_path in sorted(DOCUMENT_PATH.glob("*.txt")):
+        content = file_path.read_text(encoding="utf-8").strip()
+        if content:
+            documents.append({
+                "name": file_path.name,
+                "content": content,
+            })
 
     if not documents:
         raise ValueError(f"Nessun documento .txt trovato in {DOCUMENT_PATH}")
@@ -50,23 +65,40 @@ def load_documents():
     return documents
 
 ## Fase 1.2: Chunking dei documenti
-def chunk_documents(documents: list, chunk_size: int = 500, overlap: int = 100) -> list:
+# TO DEL 
+def chunk_document(documents: list, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list:
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        separators=["\n\n", "\n", ".", " "]  # Try these in order
+        chunk_size=chunk_size,
+        chunk_overlap=overlap,
+        separators=CHUNK_SEPARATORS
     )
 
     chunks = []
     for document in documents:
-        chunks.extend(splitter.split_text(document))
+        document_name = document.get("name", "unknown")
+        document_content = document.get("content", "")
+
+        for chunk in splitter.split_text(document_content):
+            chunks.append({
+                "name": document_name,
+                "content": chunk,
+            })
 
     return chunks
 
+## Fase 1.2: Chunking di un solo documento
+def chunk_document(name: str, content: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=overlap,
+        separators=CHUNK_SEPARATORS,  # Try these in order
+    )
+    return [{"name": name, "content": piece} for piece in splitter.split_text(content)]
 
 ## Fase 1.3: Creazioned egli embeddings
-def create_embeddings(documents: list, model) -> list:
-    embeddings = model.encode(documents)
+def create_embeddings(chunks: list, model: SentenceTransformer) -> list:
+    content_only = [chunk["content"] for chunk in chunks]
+    embeddings = model.encode(content_only, normalize_embeddings=True, show_progress_bar=False)
     embeddings = np.array(embeddings).astype('float32')  # FAISS vuole float32
 
     print("[d] Embeddings\n- shape:", embeddings.shape, "\n- dtype: ", embeddings.dtype)
@@ -78,37 +110,131 @@ def create_embeddings(documents: list, model) -> list:
     # Il numero 384 è la dimensione (o lunghezza) del vettore. Significa che ogni singola frase è stata trasformata in una sequenza di 384 numeri decimali (creata dal tuo modello di Intelligenza Artificiale, come ad esempio un modello di SentenceTransformers).
 
 
-## Fase 1.3: Creazione del database vettoriale FAISS
-def vectorize_docs(dimension: int, embedded_doc: list):
+## Fase 1.4: Cache su disco (manifest + un file di cache per ogni documento)
+def config_signature() -> str:
+    """Tutto ciò da cui dipendono chunk ed embedding: se cambia, la cache va rifatta."""
+    return json.dumps(
+        {
+            "embedding_model": EMBEDDING_MODEL,
+            "chunk_size": CHUNK_SIZE,
+            "chunk_overlap": CHUNK_OVERLAP,
+            "separators": CHUNK_SEPARATORS,
+        },
+        sort_keys=True,
+    )
+ 
+def file_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def cache_paths(filename: str) -> tuple:
+    """Nomi di cache univoci per file, basati sull'hash del nome (evita problemi con caratteri strani)."""
+    key = hashlib.sha1(filename.encode("utf-8")).hexdigest()[:16]
+    return CACHE_DIR / f"{key}.chunks.json", CACHE_DIR / f"{key}.embeddings.npy"
+ 
+def load_manifest() -> dict:
+    if MANIFEST_FILE.exists():
+        manifest = json.loads(MANIFEST_FILE.read_text(encoding="utf-8"))
+        if manifest.get("config") == config_signature():
+            return manifest
+        print("[i] Configurazione cambiata (modello/chunking): cache invalidata")
+    return {"config": config_signature(), "files": {}}
+
+
+## Fase 1.5: Costruzione (o ricarica dalla cache) della knowledge base
+def build_knowledge_base(model: SentenceTransformer) -> tuple:
+    """
+    Per ogni file .txt in DOCUMENT_PATH:
+    - se è invariato rispetto all'ultima esecuzione (stesso hash) → carica chunk ed embedding dalla cache
+    - se è nuovo o modificato → chunking + embedding, poi salva in cache
+    File rimossi dalla cartella → la loro cache viene eliminata
+ 
+    Ritorna (chunks, embeddings) pronti per costruire l'indice FAISS.
+    """
+    if not DOCUMENT_PATH.is_dir():
+        raise FileNotFoundError(f"[-] Directory dei documenti non trovata: {DOCUMENT_PATH}")
+    CACHE_DIR.mkdir(exist_ok=True)
+ 
+    manifest = load_manifest()
+    current_files = {p.name: p for p in sorted(DOCUMENT_PATH.glob("*.txt"))}
+ 
+    if not current_files:
+        raise ValueError(f"Nessun documento .txt trovato in {DOCUMENT_PATH}")
+ 
+    # File rimossi dalla cartella dall'ultima esecuzione: elimina la loro cache
+    for name in set(manifest["files"]) - set(current_files):
+        chunks_path, emb_path = cache_paths(name)
+        chunks_path.unlink(missing_ok=True)
+        emb_path.unlink(missing_ok=True)
+        del manifest["files"][name]
+        print(f"[-] Rimosso dalla cache: {name}")
+ 
+    all_chunks = []
+    all_embeddings = []
+ 
+    for name, path in current_files.items():
+        current_hash = file_hash(path)
+        chunks_path, emb_path = cache_paths(name)
+        entry = manifest["files"].get(name)
+ 
+        if entry and entry["hash"] == current_hash and chunks_path.exists() and emb_path.exists():
+            # File invariato → carica dalla cache, niente da ricalcolare
+            chunks = json.loads(chunks_path.read_text(encoding="utf-8"))
+            embeddings = np.load(emb_path)
+            print(f"[=] Da cache: {name} ({len(chunks)} chunk)")
+        else:
+            # File nuovo o modificato → chunking + embedding, poi salva
+            content = path.read_text(encoding="utf-8").strip()
+            if not content:
+                manifest["files"].pop(name, None)
+                continue
+ 
+            chunks = chunk_document(name, content)
+            embeddings = create_embeddings(chunks, model)
+ 
+            chunks_path.write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
+            np.save(emb_path, embeddings)
+            manifest["files"][name] = {"hash": current_hash, "n_chunks": len(chunks)}
+            print(f"[+] Elaborato e messo in cache: {name} ({len(chunks)} chunk)")
+ 
+        all_chunks.extend(chunks)
+        all_embeddings.append(embeddings)
+ 
+    MANIFEST_FILE.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+ 
+    return all_chunks, np.vstack(all_embeddings).astype("float32")
+
+## Fase 1.6: Creazione del database vettoriale FAISS
+def vectorize_docs(dimension: int, embedded_doc: list) -> faiss.Index:
     #L'indice più semplice è IndexFlatL2 (ricerca esatta per distanza euclidea) o IndexFlatIP (per dot product, utile se vuoi cosine similarity su vettori normalizzati):
 
     # Quando andrai a creare il tuo indice FAISS, la prima cosa che FAISS ti chiederà sarà: "Ok, vuoi creare una mappa, ma quanto devono essere lunghi i vettori che cammineranno dentro questa mappa?".
-    index = faiss.IndexFlatL2(dimension)
+    index = faiss.IndexFlatIP(dimension)
     index.add(np.array(embedded_doc))
     print("[i] indice: ", index.ntotal)
     return index
 
 
 # Fase 2: Retrieval (Finding Relevant Knowledge)
-def embed_prompt(prompt: str, k: int = 1) -> list:
-    embeded_prompt = np.asarray(model.encode([prompt]), dtype='float32')
+def get_revelant_chunks(chunks: list, prompt: str, k: int, embed_model: SentenceTransformer, index: faiss.Index) -> list:
+        
+    embeded_prompt = np.asarray(embed_model.encode([prompt]), dtype='float32')
+
+    k = min (k, FIND_REVELANT_KNOWLEDGE) # evita indici -1 se ci sono meno di k vettori totali
+
     distance, indices = index.search(embeded_prompt, k=k)  # Cerca i k chunk più vicini
-    print("Distances:", distance, "Indices:", indices) # Distances: [[0.5583499 1.4144423 1.5191814]] Indices: [[0 2 3]]
-    return [chunks[i] for i in indices[0]]  # Restituisce i documenti corrispondenti agli indici trovati
+    print("[i] Distances:", distance, "Indices:", indices) # Distances: [[0.5583499 1.4144423 1.5191814]] Indices: [[0 2 3]]
+    return [chunks[i] for i in indices[0] if i != -1]  # Restituisce i documenti corrispondenti agli indici trovati
+
 
 # Fase 3: Generation (Creating the Answer)
-def rag_function(user_query: str):
+def generate_answare(retrived_chunks, user_prompt: str):
 
-    retrived_chunks = embed_prompt(user_query)
-
-    prompt = f"""Answer the question based only on this context:\n\"\"\"
-{chr(10).join(retrived_chunks)}.\"\"\"
-Question: {user_query}.
-If the answer is not contained within the text below, say "I don't know".""" # char(10) = \n in ASCII
+    context = "\n".join(chunk['name'] +":"+ chunk["content"] for chunk in retrived_chunks)
+    prompt = f"""Answer the question based only on the context and always reporting the source. If the answer is not contained within the text below, say "I don't know. CONTEXT:\n\"\"\" {context}.\"\"\"\nQUESTION: {user_prompt}.""" # char(10) = \n in ASCII
 
     print("[i] Retrieved Chunks:")
     for chunk_number, chunk in enumerate(retrived_chunks, start=1):
-        print(f"\n--- CHUNK {chunk_number} ---\n{chunk}")
+        print(f"\n--- CHUNK {chunk_number} ({chunk['name']}) ---\n{chunk['content']}")
     print("\n--------------------")
     print("[i] Prompt for LLM:", prompt, "\n--------------------")
 
@@ -148,11 +274,10 @@ if __name__ == "__main__":
 
     print(f"[i] Modello di embedding: {EMBEDDING_MODEL} (max {model.max_seq_length} token)")
 
-    documents = load_documents()
-    print("[+] Documents loaded")
-
-    chunks = chunk_documents(documents)
-    print(f"[i] Creati {len(chunks)} chunk")    
+    print(f"[i] Modello di embedding: {EMBEDDING_MODEL} (max {model.max_seq_length} token)")
+ 
+    chunks, embedded_docs = build_knowledge_base(model)
+    print(f"[i] Knowledge base pronta: {len(chunks)} chunk totali")    
 
     embedded_docs = create_embeddings(chunks, model)
     print("[+] Embeddings Creati")
@@ -172,7 +297,8 @@ if __name__ == "__main__":
 
         started_at = perf_counter()
 
-        response = rag_function(user_input)
+        retrived_chunks = get_revelant_chunks(chunks, user_input, FIND_REVELANT_KNOWLEDGE, model, index)
+        response = generate_answare(retrived_chunks, user_input)
 
         usage = None
         finish_reason = "N/D"
