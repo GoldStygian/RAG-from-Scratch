@@ -27,17 +27,17 @@ CACHE_DIR = BASE_DIR / "index_cache"
 MANIFEST_FILE = CACHE_DIR / "manifest.json"
 
 #EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Modello di embedding locale, non richiede Ollama
-EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"  # Modello multilingue adatto anche all'italiano
+# EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"  # Modello multilingue adatto anche all'italiano
+EMBEDDING_MODEL = "intfloat/multilingual-e5-base"
 EMBEDDING_DEVICE = "cpu" # oppure cuda per GPU Nvidia
+CHUNK_SIZE_RATIO = 0.80
+CHUNK_OVERLAP_RATIO = 0.15
+CHUNK_SEPARATORS = ["\n\n", "\n", ". ", "? ", "! ", " ", ""]
 
 MODEL_NAME = "llama3.2:3b" #"qwen2.5:7b" #qwen3.5
 TEMPERATURE = 0.3
 
 FIND_REVELANT_KNOWLEDGE = 4
-
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 100
-CHUNK_SEPARATORS = ["\n\n", "\n", ". ", "? ", "! ", " ", ""]
 
 client = OpenAI(
     base_url="http://localhost:11434/v1",
@@ -64,36 +64,28 @@ def load_documents():
 
     return documents
 
-## Fase 1.2: Chunking dei documenti
-# TO DEL 
-def chunk_document(documents: list, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=overlap,
-        separators=CHUNK_SEPARATORS
-    )
-
-    chunks = []
-    for document in documents:
-        document_name = document.get("name", "unknown")
-        document_content = document.get("content", "")
-
-        for chunk in splitter.split_text(document_content):
-            chunks.append({
-                "name": document_name,
-                "content": chunk,
-            })
-
-    return chunks
 
 ## Fase 1.2: Chunking di un solo documento
-def chunk_document(name: str, content: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list:
-    splitter = RecursiveCharacterTextSplitter(
+def chunk_document(name: str, content: str, chunk_size: int, overlap: int) -> list:
+        
+    splitter = RecursiveCharacterTextSplitter( # chunker
         chunk_size=chunk_size,
         chunk_overlap=overlap,
+        length_function=lambda text: count_tokens(text, model), # faccio lavorare il chunker direttamente in token
         separators=CHUNK_SEPARATORS,  # Try these in order
     )
+
+    # con il tokenizer significa che vengono cosi specificati i token non i caratteri.
+
     return [{"name": name, "content": piece} for piece in splitter.split_text(content)]
+
+def count_tokens(text, model):
+    return len(
+        model.tokenizer.encode(
+            text,
+            add_special_tokens=True
+        )
+    )
 
 ## Fase 1.3: Creazioned egli embeddings
 def create_embeddings(chunks: list, model: SentenceTransformer) -> list:
@@ -143,7 +135,7 @@ def load_manifest() -> dict:
 ## Fase 1.5: Costruzione (o ricarica dalla cache) della knowledge base
 def build_knowledge_base(model: SentenceTransformer) -> tuple:
     """
-    Per ogni file .txt in DOCUMENT_PATH:
+    Per ogni file .txt o .md in DOCUMENT_PATH e nelle sue sottocartelle:
     - se è invariato rispetto all'ultima esecuzione (stesso hash) → carica chunk ed embedding dalla cache
     - se è nuovo o modificato → chunking + embedding, poi salva in cache
     File rimossi dalla cartella → la loro cache viene eliminata
@@ -155,10 +147,14 @@ def build_knowledge_base(model: SentenceTransformer) -> tuple:
     CACHE_DIR.mkdir(exist_ok=True)
  
     manifest = load_manifest()
-    current_files = {p.name: p for p in sorted(DOCUMENT_PATH.glob("*.txt"))}
+    current_files = {
+        p.relative_to(DOCUMENT_PATH).as_posix(): p
+        for p in sorted(DOCUMENT_PATH.rglob("*"))
+        if p.is_file() and p.suffix.lower() in {".txt", ".md"}
+    }
  
     if not current_files:
-        raise ValueError(f"Nessun documento .txt trovato in {DOCUMENT_PATH}")
+        raise ValueError(f"Nessun documento .txt o .md trovato in {DOCUMENT_PATH}")
  
     # File rimossi dalla cartella dall'ultima esecuzione: elimina la loro cache
     for name in set(manifest["files"]) - set(current_files):
@@ -188,7 +184,7 @@ def build_knowledge_base(model: SentenceTransformer) -> tuple:
                 manifest["files"].pop(name, None)
                 continue
  
-            chunks = chunk_document(name, content)
+            chunks = chunk_document(name, content, CHUNK_SIZE, CHUNK_OVERLAP)
             embeddings = create_embeddings(chunks, model)
  
             chunks_path.write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
@@ -217,7 +213,10 @@ def vectorize_docs(dimension: int, embedded_doc: list) -> faiss.Index:
 # Fase 2: Retrieval (Finding Relevant Knowledge)
 def get_revelant_chunks(chunks: list, prompt: str, k: int, embed_model: SentenceTransformer, index: faiss.Index) -> list:
         
-    embeded_prompt = np.asarray(embed_model.encode([prompt]), dtype='float32')
+    embeded_prompt = np.asarray(
+        embed_model.encode([prompt], normalize_embeddings=True),
+        dtype='float32'
+    )
 
     k = min (k, FIND_REVELANT_KNOWLEDGE) # evita indici -1 se ci sono meno di k vettori totali
 
@@ -271,16 +270,15 @@ if __name__ == "__main__":
     print("Sysyem RAG Initialization ...")
 
     model = SentenceTransformer(EMBEDDING_MODEL, device=EMBEDDING_DEVICE) # model = SentenceTransformer(EMBEDDING_MODEL, device='cuda')  # 384-dim embeddings in locale, GPU no ollama, ma lo scarica sempre?
-
-    print(f"[i] Modello di embedding: {EMBEDDING_MODEL} (max {model.max_seq_length} token)")
-
-    print(f"[i] Modello di embedding: {EMBEDDING_MODEL} (max {model.max_seq_length} token)")
+    MAX_TOKENS = model.max_seq_length
+    CHUNK_SIZE = int(MAX_TOKENS * CHUNK_SIZE_RATIO)
+    CHUNK_OVERLAP = int(CHUNK_SIZE * CHUNK_OVERLAP_RATIO)
+    print(f"[i] Modello di embedding: {EMBEDDING_MODEL} (max {MAX_TOKENS} token)")
+    print(f"[i] Chunk size: {CHUNK_SIZE} token")
+    print(f"[i] Chunk overlap: {CHUNK_OVERLAP} token")
  
     chunks, embedded_docs = build_knowledge_base(model)
     print(f"[i] Knowledge base pronta: {len(chunks)} chunk totali")    
-
-    embedded_docs = create_embeddings(chunks, model)
-    print("[+] Embeddings Creati")
 
     index = vectorize_docs(embedded_docs.shape[1], embedded_docs)
 
