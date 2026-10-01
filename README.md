@@ -1,6 +1,8 @@
 # RAG from Scratch
 
-Questo progetto è una mini implementazione di un sistema RAG (Retrieval-Augmented Generation) in Python a scopo didattico.
+Implementazione di un sistema **RAG (Retrieval-Augmented Generation)** in Python a scopo didattico.
+
+Gira interamente **in locale**:, LLM servito da **Ollama**, nessuna chiamata a un'API esterna a pagamento.
 
 Il sistema RAG proposto ha le seguenti caratteristiche:
 - leggere documenti testuali dalla cartella `knowledgebase`
@@ -12,10 +14,18 @@ Il sistema RAG proposto ha le seguenti caratteristiche:
 
 ## Struttura del progetto
 
-- `main.py` – logica principale del progetto
+- `main.py` – logica end-to-end (ingestion, retrieval, generation)
 - `knowledgebase/` – documenti testo usati come base conoscitiva
-- `index_cache/` – cache locale dei chunk e degli embedding generati
+- `index_cache/` – cache di chunk ed embedding (generata automaticamente)
 - `pyproject.toml` – dipendenze del progetto
+
+## Come funziona
+
+1. I documenti in `knowledgebase/` vengono letti e divisi in chunk con overlap (`RecursiveCharacterTextSplitter`, lunghezza misurata in token, non caratteri).
+2. Ogni chunk viene trasformato in un embedding con `intfloat/multilingual-e5-base` (modello multilingue, adatto anche all'italiano).
+3. Gli embedding finiscono in un indice FAISS (`IndexFlatIP`, similarità coseno su vettori normalizzati).
+4. Alla domanda dell'utente viene calcolato l'embedding e recuperati i **K chunk più simili**.
+5. I chunk trovati vengono inseriti nel prompt e passati a un modello locale via Ollama, che risponde **solo** sulla base del contesto fornito — se l'informazione non c'è, lo dichiara.
 
 
 ## Caricamento e cache
@@ -47,8 +57,8 @@ In pratica, la cache è per-documento e viene invalidata se:
 ## Requisiti
 
 - Python 3.11+
-- Internet per scaricare i modelli di embedding e, se necessario, i modelli LLM
-- Ollama installato e in esecuzione localmente
+- [Ollama](https://ollama.com) installato e in esecuzione localmente
+- connessione internet per scaricare il modello di embedding (e il modello LLM, la prima volta)
 
 ## Installazione
 
@@ -60,52 +70,38 @@ uv sync
 
 ## Esecuzione 
 
-### Avvio di Ollama
-
-Assicurati che Ollama sia in esecuzione:
-
 ```bash
-ollama serve
+ollama serve # Assicurati che Ollama sia in esecuzione
+ollama pull llama3.2:3b # Poi verifica e scarica il modello richiesto
+uv run main.py # esegui il RAG
+# oppure: python main.py
 ```
 
-Poi verifica e scarica il modello richiesto:
+Il programma costruisce (o ricarica dalla cache) la knowledge base, poi apre un prompt interattivo: scrivi una domanda e premi invio. `exit` per uscire.
 
-```bash
-ollama pull llama3.2:3b
-```
+Ad ogni risposta viene stampato un riepilogo con modello usato, token consumati, durata e motivo di terminazione.
 
-### Avvio del main
 
-Avvia il progetto con:
+## Configurazione
 
-```bash
-uv run .\main.py
-```
+I parametri principali sono in cima a `main.py`:
 
-oppure:
+| Parametro | Descrizione |
+|---|---|
+| `EMBEDDING_MODEL` | Modello di embedding (default: `intfloat/multilingual-e5-base`) |
+| `MODEL_NAME` | Modello LLM servito da Ollama (default: `llama3.2:3b`) |
+| `CHUNK_SIZE_RATIO` / `CHUNK_OVERLAP_RATIO` | Dimensione e overlap dei chunk, come frazione della finestra massima del modello di embedding |
+| `FIND_REVELANT_KNOWLEDGE` | Quanti chunk recuperare per ogni domanda (K) |
+| `TEMPERATURE` | Temperatura del modello generativo |
 
-```bash
-python main.py
-```
 
-## Come funziona
+## Setup di test
 
-1. Il programma legge tutti i file `.txt` presenti in `knowledgebase/`
-2. I documenti vengono divisi in chunk
-3. Ogni chunk viene trasformato in embedding
-4. I vettori vengono memorizzati in FAISS
-5. Quando inserisci una domanda, viene calcolato l'embedding della query
-6. Il sistema recupera i chunk più simili
-7. Il contesto viene passato al modello LLM
-8. La risposta viene generata usando solo le informazioni trovate nei documenti
+Configurazione con cui il progetto è stato validato:
 
-## Test
-
-Il RAG è stato eseguito inizialmente con le seguenti caratteristiche
-
-Database vettoriale: FAISS
-Modello di Embvedding: paraphrase-multilingual-MiniLM-L12-v2
-LLM testato: llama3.2:3b
+- **Vector store**: FAISS (`IndexFlatIP`)
+- **Modello di embedding**: `paraphrase-multilingual-MiniLM-L12-v2`
+- **LLM**: `llama3.2:3b` via Ollama
 
 ## Nota
 
@@ -117,6 +113,8 @@ $env:HF_TOKEN = "<tuo_token_hf>"
 
 Questo non è obbligatorio, ma aiuta a evitare limiti di download e rate limit più rigidi.
 
-## Upcoming Features
+## Roadmap
 
-- Implementazione di comandi specifici per: aggiornare la cache ecc..
+- [ ] Comandi dedicati per forzare l'aggiornamento della cache
+- [ ] Supporto ad altri formati di documento oltre a `.txt`/`.md`
+- [ ] Valutazione quantitativa della qualità del retrieval
